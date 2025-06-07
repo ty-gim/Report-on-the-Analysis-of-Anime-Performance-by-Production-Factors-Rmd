@@ -1,14 +1,14 @@
 # Anime Performance Analysis — STA 160 Final Project
-This repository contains the full R code and supporting materials for my final project in STA 160: Data Analysis and Statistical Modeling. The project explores how various production factors (e.g., release season, studio, genre, source material) influence the success of anime titles using data-driven statistical techniques and visualizations.
+This repository contains the full R code and supporting materials for my final project in STA 160. The project explores how various production factors (e.g., release season, studio, genre, source material) influence the success of anime titles using data-driven statistical techniques and visualizations.
 ---
 ## Project Overview
 Title: Report on the Analysis of Anime Performance by Production Factors
 
 ### Goal:
-To understand which production-related features are most associated with anime success, measured through metrics such as score, rank, popularity, and member count. This is done using exploratory data analysis (EDA), principal component analysis (PCA), multiple correspondence analysis (MCA), clustering (k-means), and regression modeling.
+To understand which production-related features are most closely correlated to an anime's success, measured through metrics such as score, rank, popularity, and member count. This is done using exploratory data analysis (EDA), principal component analysis (PCA), multiple correspondence analysis (MCA), clustering (k-means), and regression modeling.
 
 ### Dataset:
-Anime Dataset 2023 from Kaggle (originally scraped from MyAnimeList). The dataset includes metadata on 15,000+ anime titles with variables such as:
+Anime Dataset 2023 from Kaggle (originally scraped from MyAnimeList API). The dataset includes metadata on 20,000+ anime titles with variables such as:
 - Title, release season, studio, producers
 - Genres, type, source material
 - Popularity, rank, user score, number of members/favorites
@@ -30,7 +30,7 @@ Anime Dataset 2023 from Kaggle (originally scraped from MyAnimeList). The datase
   - Feature importance via coefficient significance
 ---
 ## Dependencies
-This project was built in R (version ≥ 4.2) and uses the following libraries:
+This project was built in R (version 4.5.0) and uses the following libraries:
 ```r
 library(tidyverse)
 library(janitor)
@@ -68,7 +68,7 @@ install.packages(c("tidyverse", "janitor", "skimr", "DataExplorer", "ggrepel",
 ---
 ## Key Findings
 - Production factors: Certain studios (e.g., Kyoto Animation), sources (e.g., manga), and types (e.g., TV series) are consistently linked to higher success.
-- Clustering: Five interpretable anime production clusters were identified with strong links to genre, source, and studio.
+- Clustering: Five interpretable anime production clusters had strong links to genre, source, and studio.
 - Modeling: Type and source were significant predictors of anime score even after controlling for PCA dimensions and clustering.
 ---
 # Author
