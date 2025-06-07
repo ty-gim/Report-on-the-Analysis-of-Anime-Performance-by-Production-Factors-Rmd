@@ -1,0 +1,1079 @@
+---
+title: "Anime Dataset EDA"
+author: "Theodore Gim"
+date: "2025-06-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 1. Setup and Packages
+
+```{r, echo=FALSE}
+# Load packages
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(DataExplorer)
+library(ggrepel)
+library(corrplot)
+library(car)
+library(multcomp)
+library(fastDummies)
+library(lmtest)
+library(sandwich)
+library(knitr)
+library(tibble)
+library(broom)
+library(purrr)
+library(GGally)
+library(FactoMineR)
+library(factoextra)
+library(RColorBrewer)
+library(gridExtra)
+library(rlang)
+library(ggfortify)
+library(patchwork)
+library(reshape2)
+```
+
+## 2. Data Cleaning & Transformation
+
+```{r, echo=FALSE, message=TRUE, warning=TRUE, error=TRUE}
+# STEP 1: Load the dataset
+# anime <- read_csv("D:/Downloads/Anime 2023 Dataset/anime-dataset-2023.csv")
+anime <- read_csv("~/UCD Classes/STA 160/anime-dataset-2023.csv")
+
+# STEP 2: Clean the column names
+anime <- anime %>% clean_names()  # e.g., "Score" → "score"
+
+# STEP 3: Drop unneeded columns
+anime <- anime %>%
+  dplyr::select(-english_name, -other_name, -synopsis, -status, -image_url)
+
+# Helper function for rating to numeric min age
+rating_to_age <- function(rating) {
+  case_when(
+    rating == "G - All Ages" ~ 0,
+    rating == "PG - Children" ~ 7,
+    rating == "PG-13 - Teens 13 or older" ~ 13,
+    rating %in% c("R - 17+ (violence & profanity)", "R+ - Mild Nudity") ~ 17,
+    rating == "Rx - Hentai" ~ 18,
+    TRUE ~ NA_real_
+  )
+}
+
+# STEP 4: Mutate numeric variables and extract season, duration, rating_age
+anime <- anime %>%
+  mutate(
+    score = suppressWarnings(as.numeric(score)),
+    rank = as.numeric(rank),
+    popularity = as.numeric(popularity),
+    season = str_extract(premiered, "^(winter|spring|summer|fall)"),
+    season = fct_na_value_to_level(
+      factor(season, levels = c("winter", "spring", "summer", "fall")),
+      level = "Unknown"
+    ),
+    studio_count = str_count(studios, ",") + 1,
+    is_collab = studio_count > 1,
+    duration_mins = case_when(
+      str_detect(duration, "hr") ~ {
+        hours <- as.numeric(str_extract(duration, "\\d+(?= hr)"))
+        mins <- as.numeric(str_extract(duration, "\\d+(?= min)"))
+        mins[is.na(mins)] <- 0
+        hours * 60 + mins
+      },
+      str_detect(duration, "min") ~ as.numeric(str_extract(duration, "\\d+")),
+      TRUE ~ NA_real_
+    ),
+    rating_age = rating_to_age(rating),
+  episodes = suppressWarnings(as.numeric(episodes))  
+)
+
+# STEP 5: Explode multi-entry columns into long format, keep all other columns intact INCLUDING anime_id
+anime_long <- anime %>%
+  filter(!is.na(score)) %>%
+  dplyr::select(anime_id, everything()) %>%  # Make sure anime_id is kept upfront
+  tidyr::separate_rows(studios, sep = ",") %>%
+  tidyr::separate_rows(producers, sep = ",") %>%
+  tidyr::separate_rows(licensors, sep = ",") %>%
+  tidyr::separate_rows(genres, sep = ",") %>%
+  mutate(across(c(studios, producers, licensors, genres), str_trim))
+
+
+# STEP 6: Convert exploded variables to factors
+anime_long <- anime_long %>%
+  mutate(
+    studios = as.factor(studios),
+    producers = as.factor(producers),
+    licensors = as.factor(licensors),
+    genres = as.factor(genres)
+  )
+
+# STEP 7: Filter out Unknown seasons for filtered data
+anime_filtered <- anime %>%
+  filter(season != "Unknown")
+
+# Summaries for numeric variables
+summary(anime_long %>% select(score, episodes, duration_mins, rating_age))
+
+# Count of missing values per key variable
+colSums(is.na(anime_long %>% select(score, episodes, duration_mins, rating_age, studios, producers, licensors, genres)))
+
+# Top 10 factor levels for studios, producers, licensors, genres
+anime_long %>%
+  count(studios, sort = TRUE) %>%
+  head(10)
+
+anime_long %>%
+  count(producers, sort = TRUE) %>%
+  head(10)
+
+anime_long %>%
+  count(licensors, sort = TRUE) %>%
+  head(10)
+
+anime_long %>%
+  count(genres, sort = TRUE) %>%
+  head(10)
+
+## Summary:
+# The dataset includes 75,941 anime-genre/studio/producer/licensor combinations.
+# Key numeric variables (score, episodes, duration_mins, rating_age) are mostly clean with manageable NA counts.
+# Multi-entry columns were exploded to long format, retaining relational structure.
+# Major factor variables such as studios and producers are extremely high-cardinality, with many rare levels.
+# For example, top studios like J.C.Staff and Madhouse appear in ~2,800+ records each, while UNKNOWN dominates in all groups (e.g., 5,389 UNKNOWN studios).
+# This transformation enables meaningful group-level analysis, but also necessitates careful treatment of rare categories during modeling.
+```
+
+## 3. Testing Significance of All Categorical Variables
+
+```{r, echo=FALSE}
+# List of categorical variables to test
+cat_vars <- c("source", "type", "studios", "producers", "licensors", "genres")
+
+# Base model with only numeric predictors
+base_formula <- as.formula("score ~ episodes + duration_mins + rating_age")
+
+# Fit base model
+base_model <- lm(base_formula, data = anime_long)
+
+# Function to compare full vs. base model for each categorical variable
+anova_results <- map_df(cat_vars, function(var) {
+  # Build formula string
+  full_formula <- as.formula(paste("score ~ episodes + duration_mins + rating_age +", var))
+  
+  # Fit full model
+  full_model <- lm(full_formula, data = anime_long)
+  
+  # Perform ANOVA comparison
+  a <- anova(base_model, full_model)
+  
+  # Extract p-value and F statistic
+  tibble(
+    variable = var,
+    df = a$Df[2],
+    F_stat = round(a$`F`[2], 2),
+    p_value = signif(a$`Pr(>F)`[2], 4)
+  )
+})
+
+# Display results
+kable(anova_results, caption = "ANOVA Model Comparisons for Categorical Predictors")
+
+# Sample size used
+nrow(anime_long)
+
+# R-squared for base and one example full model (e.g. for "studios")
+summary(base_model)$r.squared
+summary(lm(score ~ episodes + duration_mins + rating_age + studios, data = anime_long))$r.squared
+
+# Extract model diagnostics
+model_data <- augment(base_model)
+
+# 1. Residuals vs Fitted
+p1 <- ggplot(model_data, aes(.fitted, .resid)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  geom_smooth(method = "loess", color = "red", se = FALSE) +
+  labs(title = "Residuals vs Fitted", x = "Fitted values", y = "Residuals") +
+  theme_minimal()
+
+# 2. Normal Q-Q
+p2 <- ggplot(model_data, aes(sample = .std.resid)) +
+  stat_qq(alpha = 0.4, color = "steelblue") +
+  stat_qq_line(color = "red") +
+  labs(title = "Normal Q-Q", x = "Theoretical Quantiles", y = "Standardized Residuals") +
+  theme_minimal()
+
+# 3. Scale-Location (Spread vs Fitted)
+p3 <- ggplot(model_data, aes(.fitted, sqrt(abs(.std.resid)))) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  geom_smooth(method = "loess", color = "red", se = FALSE) +
+  labs(title = "Scale-Location", x = "Fitted values", y = "Sqrt(|Standardized Residuals|)") +
+  theme_minimal()
+
+# 4. Residuals vs Leverage
+p4 <- ggplot(model_data, aes(.hat, .std.resid)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  geom_smooth(method = "loess", color = "red", se = FALSE) +
+  labs(title = "Residuals vs Leverage", x = "Leverage", y = "Standardized Residuals") +
+  theme_minimal()
+
+# Arrange all four plots
+(p1 | p2) / (p3 | p4)
+
+# Summary:
+# ANOVA model comparisons show all six categorical predictors (source, type, studios, producers, licensors, genres) significantly improve model fit (p < 0.001).
+# The F-statistics are especially large for 'type' (F ≈ 1681) and 'source' (F ≈ 505), indicating strong explanatory power.
+# Base model R² = 0.105, while adding 'studios' increases it substantially to R² ≈ 0.423.
+# Residual plots (not shown) should be checked for model assumptions, but the huge df of categorical variables like studios and producers (>900) indicates potential overfitting without collapsing rare levels.
+# Conclusion: All categorical variables are significant and should be retained, but further preprocessing (e.g., lumping rare levels) is critical to prevent model inflation.
+```
+
+## 4. Testing Significance of All Numeric Variables
+
+```{r, echo=FALSE}
+# Filter data to complete cases for all numeric vars + score
+model_data <- anime_long %>%
+  filter(!is.na(score), !is.na(episodes), !is.na(duration_mins), !is.na(rating_age))
+
+num_vars <- c("episodes", "duration_mins", "rating_age")
+full_num_vars <- num_vars
+
+anova_num_results <- map_df(num_vars, function(var) {
+  
+  other_vars <- setdiff(full_num_vars, var)
+  
+  base_formula_str <- if(length(other_vars) == 0) {
+    "score ~ 1"
+  } else {
+    paste("score ~", paste(other_vars, collapse = " + "))
+  }
+  
+  base_formula <- as.formula(base_formula_str)
+  base_model <- lm(base_formula, data = model_data)
+  
+  full_formula_str <- paste(base_formula_str, "+", var)
+  full_formula <- as.formula(full_formula_str)
+  full_model <- lm(full_formula, data = model_data)
+  
+  a <- anova(base_model, full_model)
+  
+  tibble(
+    variable = var,
+    df = a$Df[2],
+    F_stat = round(a$`F`[2], 2),
+    p_value = signif(a$`Pr(>F)`[2], 4)
+  )
+})
+
+anova_num_results
+
+## Summary:
+# All numeric predictors — episodes, duration_mins, and rating_age — are highly significant (p < 0.001) when tested independently via nested ANOVA.
+# duration_mins has the strongest explanatory power (F ≈ 4598), followed by rating_age (F ≈ 2994) and episodes (F ≈ 1887).
+# This indicates that each of these numeric variables contributes unique variance to predicting anime scores.
+# Conclusion: All numeric variables should be retained in the regression model. No transformation appears necessary at this stage, but scale and distribution should be reviewed in univariate EDA for modeling robustness.
+```
+
+## 5. Summary Stats & Correlations Between Success Metrics
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Success metrics (response variables)
+success_metrics <- c("score", "rank", "popularity", "favorites", "members")
+
+# Select success metric columns only and convert to numeric
+anime_success <- anime_long %>% 
+  dplyr::select(all_of(success_metrics)) %>% 
+  mutate(across(everything(), as.numeric))
+
+# Calculate correlation matrix (pairwise complete observations)
+cor_mat <- cor(anime_success, use = "pairwise.complete.obs")
+
+# Melt correlation matrix to long format for ggplot
+cor_long <- melt(cor_mat)
+
+# Plot correlation heatmap with coefficients
+ggplot(cor_long, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", value)), color = "black", size = 5) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1,1), space = "Lab", 
+                       name = "Pearson\nCorrelation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size=12),
+        axis.text.y = element_text(size=12)) +
+  labs(title = "Correlation Heatmap of Anime Success Metrics",
+       x = NULL, y = NULL)
+```
+
+## 6. Test Predictor Variables Against each Success Metric
+
+```{r, fig.width=7, fig.height=6, echo=FALSE, warning=FALSE, message=FALSE}
+# Define predictor and response variables
+numeric_preds <- c("episodes", "duration_mins", "rating_age")
+categorical_preds <- c("source", "type", "studios", "producers", "licensors", "genres")
+success_metrics <- c("score", "rank", "popularity", "favorites", "members")
+
+# Test numeric predictors for each success metric
+test_numeric <- function(metric) {
+  map_df(numeric_preds, function(pred) {
+    formula <- as.formula(paste(metric, "~", pred))
+    fit <- lm(formula, data = anime_long)
+    tidy_fit <- broom::tidy(fit)
+    p_value <- tidy_fit$p.value[2]
+    tibble(
+      metric = metric,
+      predictor = pred,
+      p_value = p_value
+    )
+  })
+}
+
+# Test categorical predictors for each success metric using ANOVA
+test_categorical <- function(metric) {
+  map_df(categorical_preds, function(pred) {
+    formula <- as.formula(paste(metric, "~", pred))
+    fit <- lm(formula, data = anime_long)
+    aov_res <- anova(fit)
+    p_value <- aov_res$`Pr(>F)`[1]
+    tibble(
+      metric = metric,
+      predictor = pred,
+      p_value = p_value
+    )
+  })
+}
+
+# Run tests for all success metrics
+numeric_results <- map_df(success_metrics, test_numeric)
+categorical_results <- map_df(success_metrics, test_categorical)
+
+# Combine results and sort
+all_results <- bind_rows(numeric_results, categorical_results) %>%
+  arrange(metric, p_value)
+
+# Print summary table: top 5 predictors per metric (lowest p-values)
+summary_table <- all_results %>%
+  group_by(metric) %>%
+  slice_min(order_by = p_value, n = 5) %>%
+  ungroup() %>%
+  mutate(p_value = signif(p_value, 3))
+
+print(summary_table)
+
+## Summary:
+# All numeric and categorical predictors tested (episodes, duration_mins, rating_age, source, type, studios, producers, licensors, genres)
+# were found to be statistically significant (p < 0.05, many < 2e-16) for at least one success metric.
+# Notably:
+# - Every predictor was significant for all five response variables (score, rank, popularity, members, favorites).
+# - This supports including these variables in downstream modeling (e.g., regression or clustering), though multicollinearity among outcome variables should be considered.
+# - Results reinforce findings from Section 3 and 4, confirming that each predictor contributes meaningful variation in anime performance outcomes.
+```
+
+## 7. Further Analysis of Significance Between Predictors and Success Metrics
+
+```{r, echo=FALSE}
+# Define predictors
+numeric_preds <- c("episodes", "duration_mins", "rating_age")
+categorical_preds <- c("source", "type", "studios", "producers", "licensors", "genres")
+predictors <- c(numeric_preds, categorical_preds)  # Combined predictor list
+success_metrics <- c("score", "rank", "popularity", "favorites", "members")
+
+# Function to calculate R-squared for simple linear regression of metric ~ predictor
+get_r2 <- function(metric, pred) {
+  fit <- lm(as.formula(paste(metric, "~", pred)), data = anime_long)
+  tibble(
+    metric = metric,
+    predictor = pred,
+    r_squared = summary(fit)$r.squared
+  )
+}
+
+# Calculate R² values for all predictor-success metric pairs
+r2_results <- map_df(success_metrics, function(metric) {
+  map_df(predictors, function(pred) get_r2(metric, pred))
+})
+
+# Create a summary table with mean R² by predictor type and predictor
+r2_summary <- r2_results %>%
+  mutate(pred_type = case_when(
+    predictor %in% numeric_preds ~ "Numeric",
+    predictor %in% categorical_preds ~ "Categorical",
+    TRUE ~ "Other"
+  )) %>%
+  group_by(pred_type, predictor) %>%
+  summarise(
+    mean_r_squared = mean(r_squared),
+    max_r_squared = max(r_squared),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_r_squared))
+
+print(r2_summary)
+
+# Visualize example numeric predictor relationship (Score vs Duration)
+ggplot(anime_long, aes(x = duration_mins, y = score)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(title = "Score vs Duration", x = "Duration (minutes)", y = "Score")
+
+# Visualize example categorical predictor relationship (Score by Source)
+ggplot(anime_long, aes(x = source, y = score)) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(title = "Score by Source")
+
+# Clean data and lump rare factor levels for regression modeling
+anime_clean <- anime %>%
+  drop_na(score, studios, producers, type, source, genres) %>%
+  mutate(
+    studios = fct_lump(factor(studios), n = 10),
+    producers = fct_lump(factor(producers), n = 10),
+    type = factor(type),
+    source = factor(source),
+    genres = fct_lump(factor(genres), n = 10)
+  )
+
+# Fit multiple regression model predicting score from categorical predictors
+model.vif <- lm(score ~ studios + producers + type + source + genres, data = anime_clean)
+
+# Extract model fit statistics
+model_fit_stats <- broom::glance(model.vif) %>%
+  dplyr::select(adj.r.squared, statistic, p.value, df)
+
+print(model_fit_stats)
+
+# Tidy model coefficients and group by predictor category
+model_summary <- broom::tidy(model.vif) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    predictor = case_when(
+      str_starts(term, "studios") ~ "studios",
+      str_starts(term, "producers") ~ "producers",
+      str_starts(term, "type") ~ "type",
+      str_starts(term, "source") ~ "source",
+      str_starts(term, "genres") ~ "genres",
+      TRUE ~ "other"
+    )
+  )
+
+# Extract top and bottom 5 estimates per predictor group
+top_bottom_by_group <- model_summary %>%
+  group_by(predictor) %>%
+  arrange(desc(estimate), .by_group = TRUE) %>%
+  slice_head(n = 5) %>%
+  bind_rows(
+    model_summary %>%
+      group_by(predictor) %>%
+      arrange(estimate, .by_group = TRUE) %>%
+      slice_head(n = 5)
+  ) %>%
+  arrange(predictor, desc(estimate))
+
+print(top_bottom_by_group)
+
+# Summarize coefficients by predictor: count, mean, min, max
+coef_summary <- model_summary %>%
+  group_by(predictor) %>%
+  summarise(
+    Count = n(),
+    Mean_Estimate = mean(estimate),
+    Min_Estimate = min(estimate),
+    Max_Estimate = max(estimate),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(abs(Mean_Estimate)))  # order by magnitude of mean effect
+
+# Print as a simple markdown table
+kable(
+  coef_summary,
+  caption = "Summary of Regression Coefficients by Predictor Category",
+  digits = 3
+)
+
+
+# Check for multicollinearity with GVIF
+print(car::vif(model.vif))
+
+
+# Adjusted R²: 0.3969 → ~40% of variation in anime score is explained by your predictors.
+# F-statistic: 199.6 on 52 and 15639 DF → p < 2.2e-16, strongly significant overall.
+# This is a good result, especially with a mix of categorical variables.
+
+# Rule of thumb: GVIF^(1/(2*Df)) < 2 is acceptable. You're in the clear — no concerning multicollinearity.
+
+## Summary:
+# We regressed anime `score` on key categorical predictors: studios, producers, type, source, and genres.
+# The model explains ~39.7% of the variance in score (Adjusted R² = 0.397), with strong overall significance (F = 199.59 on 52 and 15,639 df, p < 2.2e-16).
+# Despite potential overlap among predictors, all GVIF^(1/(2*Df)) values are < 1.14, indicating no problematic multicollinearity.
+# Studios and producers are the strongest predictors (R² = 0.39 and 0.28 respectively), while numeric variables like `duration_mins` and `episodes` have low explanatory power (R² < 0.05).
+# Some genre and source categories (e.g., "Avant Garde", "Radio", "Web novel") have large positive or negative effects.
+# These results support further modeling using production metadata as predictors of anime performance.
+```
+
+## 7.5 Correlation of Numeric Predictors to Confirm Low Multicollinearity
+
+```{r, echo=FALSE}
+num_predictors <- anime_long %>% 
+  dplyr::select(all_of(numeric_preds)) %>% 
+  mutate(across(everything(), as.numeric))
+
+corr_matrix <- cor(num_predictors, use = "pairwise.complete.obs")
+
+corrplot(corr_matrix, method = "color", addCoef.col = "black", number.cex = 0.7)
+
+# The numeric predictors are nearly uncorrelated with one another.
+
+# This is great news if you're planning to use these variables in a regression model, because it implies:
+# Low multicollinearity
+# Each variable is likely contributing independently to the response variable.
+# VIF values (Variance Inflation Factors) will probably be low.
+
+## Summary:
+# The numeric predictors (e.g., duration_mins, episodes, rating_age) show very low pairwise correlations,
+# confirming minimal multicollinearity among them.
+# This supports their independent contribution to predictive models and suggests stable coefficient estimates.
+```
+
+## 8. PCA and MCA
+
+```{r, echo=FALSE}
+# 1. Prepare categorical data for MCA
+categorical_vars <- anime_clean %>%
+  dplyr::select(studios, producers, genres, type, source) %>%
+  droplevels()
+
+# Run MCA (exclude missing rows if any)
+mca_res <- MCA(categorical_vars, graph = FALSE)
+
+# Visualize variance explained by each MCA dimension
+fviz_screeplot(mca_res, addlabels = TRUE, ncp = 10)
+
+# Extract MCA coordinates (individual factor scores)
+mca_coords <- as.data.frame(mca_res$ind$coord)
+
+fviz_mca_var(mca_res, repel = TRUE, choice = "var", axes = c(1, 2))
+mca_var <- get_mca_var(mca_res)
+head(mca_var$contrib)  # Shows contribution of categories to each dimension
+
+# 2. Prepare numeric data for PCA
+numeric_vars <- anime_clean %>%
+  dplyr::select(episodes, duration_mins, popularity, favorites, members, score = score) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  na.omit()
+
+# Make sure rows align between mca_coords and numeric_vars
+common_rows <- intersect(rownames(mca_coords), rownames(numeric_vars))
+mca_coords <- mca_coords[common_rows, ]
+numeric_vars <- numeric_vars[common_rows, ]
+
+# Run PCA on numeric variables
+pca_res <- prcomp(numeric_vars, scale. = TRUE)
+
+# Visualize variance explained by each PCA component
+fviz_screeplot(pca_res, addlabels = TRUE, ncp = 10)
+
+# Extract PCA coordinates (principal components)
+pca_coords <- as.data.frame(pca_res$x)
+
+fviz_pca_var(pca_res, col.var = "contrib", repel = TRUE)
+pca_res$rotation  # Variable loadings on each PC
+
+summary(mca_res)  # Shows inertia (variance explained) by each MCA dim
+summary(pca_res)  # Shows proportion of variance explained by each PC
+
+# 3. Optional: Combine MCA & PCA coordinates for further modeling
+combined_df <- cbind(mca_coords, pca_coords)
+
+# 4. Correlate MCA and PCA components with success metrics (like Score, Popularity)
+cor_matrix <- cor(combined_df, use = "pairwise.complete.obs")
+corrplot(cor_matrix, method = "color", addCoef.col = "black", number.cex = 0.7)
+# If success metrics are in numeric_vars, correlate their PCs/MCA dims with score or popularity:
+cor(combined_df, numeric_vars$score)
+cor(combined_df, numeric_vars$popularity)
+
+# Correlation of combined PCA/MCA with score and popularity
+cor_score <- cor(combined_df, numeric_vars$score, use = "pairwise.complete.obs")
+cor_popularity <- cor(combined_df, numeric_vars$popularity, use = "pairwise.complete.obs")
+
+print(round(cor_score, 3))
+print(round(cor_popularity, 3))
+# Correlate combined MCA dims and PCA components with score and popularity
+score_cor <- cor(combined_df, numeric_vars$score, use = "pairwise.complete.obs")
+pop_cor <- cor(combined_df, numeric_vars$popularity, use = "pairwise.complete.obs")
+
+score_cor
+pop_cor
+
+# Show rounded correlation for readability
+round(score_cor, 3)
+round(pop_cor, 3)
+# Check correlation of combined dims with score
+cor_vec_score <- cor(combined_df, numeric_vars$score, use = "pairwise.complete.obs")
+
+# Check correlation of combined dims with popularity
+cor_vec_pop <- cor(combined_df, numeric_vars$popularity, use = "pairwise.complete.obs")
+
+print(cor_vec_score)
+print(cor_vec_pop)
+
+## Summary:
+# PC1 shows a strong negative correlation with anime score (~ -0.77) and a strong positive correlation with popularity (~ +0.77),
+# indicating that the main latent factor distinguishes features that impact score and popularity in opposite ways.
+# PC5 also shows moderate positive correlations with both score and popularity.
+# MCA categorical dimensions have weak linear correlations with these metrics, suggesting their effects are more complex or nonlinear.
+# This highlights the importance of combining PCA and MCA for a full multivariate understanding of anime performance.
+```
+
+## 9. Screeplots and PCA/MCA Result Summaries
+
+```{r, echo=FALSE}
+# 1. Select numeric vars and drop NAs
+numeric_vars_full <- anime_clean %>%
+  dplyr::select(episodes, duration_mins, popularity, favorites, members, score) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  na.omit()
+
+# Save rownames of this clean numeric set
+valid_rows <- rownames(numeric_vars_full)
+
+# 2. Subset categorical vars to same rows before MCA
+categorical_vars <- anime_clean[valid_rows, ] %>%
+  dplyr::select(studios, producers, genres, type, source) %>%
+  droplevels()
+
+# 3. Run MCA only on matching rows
+mca_res <- MCA(categorical_vars, graph = FALSE)
+mca_coords <- as.data.frame(mca_res$ind$coord)
+
+# 4. Run PCA
+pca_res <- prcomp(numeric_vars_full, scale. = TRUE)
+pca_coords <- as.data.frame(pca_res$x)
+
+# 5. Combine MCA + PCA
+combined_df <- cbind(mca_coords, pca_coords)
+
+# 6. K-means clustering
+set.seed(123)
+kmeans_res <- kmeans(combined_df, centers = 3, nstart = 25)
+
+# 7. Add cluster info back to anime_clean
+anime_clustered <- anime_clean[valid_rows, ]
+anime_clustered$cluster <- factor(kmeans_res$cluster)
+
+# 8. Cluster-colored biplots
+fviz_pca_biplot(
+  pca_res,
+  label = "var",
+  col.var = "black",
+  col.ind = anime_clustered$cluster,
+  palette = "jco",
+  repel = TRUE,
+  addEllipses = TRUE,
+  ellipse.type = "convex",
+  title = "PCA Biplot Colored by Cluster"
+)
+
+fviz_mca_biplot(
+  mca_res,
+  label = "var",
+  col.var = "black",
+  select.var = list(contrib = 15),  # simplify
+  col.ind = anime_clustered$cluster,
+  palette = "jco",
+  repel = TRUE,
+  addEllipses = TRUE,
+  ellipse.type = "convex",
+  title = "MCA Biplot Colored by Cluster"
+)
+
+## MCA: Multiple Correspondence Analysis Dimensions 1 & 2
+# Dim 1 and Dim 2 represent axes capturing the most shared structure across categorical variable levels (e.g., common combinations of studios, genres, etc.).
+# Rather than variance, they maximize the chi-squared distance among categories and individuals.
+fviz_screeplot(mca_res, addlabels = TRUE, ncp = 10)
+
+## PCA: Principal Components 1 & 2
+# Dim 1 (PC1) = The direction of maximum variance in the numeric data (e.g., score, favorites, members, etc.).
+# Dim 2 (PC2) = The second-most variance direction, orthogonal to PC1.
+# These represent linear combinations of your numeric variables that explain most of the dataset's variability.
+fviz_screeplot(pca_res, addlabels = TRUE, ncp = 10)
+
+# Usually, keep PCs until you reach ~80-90% explained variance
+
+summary(mca_res)
+summary(pca_res)
+
+# Calculate correlations of PCA and MCA components with original numeric variables
+cor_pca <- cor(pca_coords, numeric_vars_full)
+cor_mca <- cor(mca_coords, numeric_vars_full)
+
+# View correlations to inform summary
+cor_pca
+cor_mca
+
+## Summary:
+# PCA loadings show that PC1 (explaining ~41% variance) mainly contrasts popularity, members, score, and favorites (all strongly negatively loaded) against episodes and duration (small negative loadings).
+# This suggests PC1 represents an axis of anime popularity/performance (high popularity, members, score) vs quantity/length metrics (episodes, duration).
+# PC2 (~21.5% variance) loads positively on episodes and favorites but negatively on duration and score, indicating a contrast between length (# episodes) and quality (score).
+# Later PCs (PC3–PC6) capture more nuanced patterns involving episodes and duration with less impact on popularity metrics.
+# MCA dimensions show weaker direct correlation with numeric variables, consistent with categorical nature.
+```
+
+10. PCA In-depth Plotting
+
+```{r, echo=FALSE}
+summary(pca_res)
+
+# Extract and show the numeric PCA loadings for PCs 1 to 5 for each variable
+pca_loadings <- round(pca_res$rotation[, 1:5], 3)
+print(pca_loadings)
+
+# Extract the percentage variance explained by each PC (for PCs 1-5)
+pca_var <- round(summary(pca_res)$importance[2, 1:5] * 100, 2)
+print(pca_var)
+
+# Extract the cluster sizes for each cluster in anime_clustered
+table(anime_clustered$cluster)
+
+
+# Extract loadings for PCs 1 through 5
+loadings <- pca_res$rotation[, 1:5]
+
+# Function to get top contributing variables for a PC
+top_loadings <- function(loadings_vector, top_n = 3) {
+  abs_loadings <- abs(loadings_vector)
+  top_vars <- names(sort(abs_loadings, decreasing = TRUE))[1:top_n]
+  paste0(top_vars, " (", round(loadings_vector[top_vars], 2), ")", collapse = ", ")
+}
+
+pcs_to_plot <- 1:4
+plots <- list()
+
+# Define cluster colors if not defined
+cluster_colors <- c("#E41A1C", "#377EB8", "#4DAF4A")  # example palette, adjust as needed
+
+for (pc in pcs_to_plot) {
+  # Short axis labels just with PC number
+  pc_label <- paste0("PC", pc)
+  pc5_label <- "PC5 (score related)"
+
+  p <- fviz_pca_biplot(
+    pca_res,
+    axes = c(pc, 5),
+    label = "var",
+    col.var = "black",
+    col.ind = anime_clustered$cluster,
+    palette = cluster_colors,
+    repel = TRUE,
+    addEllipses = TRUE,
+    ellipse.type = "convex",
+    pointsize = 2,
+    arrowsize = 1.2,
+    title = paste0("PCA Biplot (PC", pc, " vs PC5)")
+  ) + labs(x = pc_label, y = pc5_label) +
+    theme(
+      axis.text.x = element_text(angle = 0, hjust = 0.5),
+      axis.text.y = element_text(angle = 0, vjust = 0.5),
+      plot.margin = margin(1, 1, 1, 1, "cm")
+    )
+  
+  plots[[pc]] <- p
+}
+
+# Arrange plots in 2 rows x 2 cols (adjust nrow/ncol as you want)
+grid.arrange(grobs = plots, ncol = 2, nrow = 2)
+
+## What to take away:
+# Your top PCs (1-4) capture major structural differences in anime numeric features related to community size, episode count, and duration, explaining over 90% of the variance.
+# PC5 isolates success (score + popularity), which you want to understand how it relates to other variables.
+# Plotting PC5 against others (PC1–PC4) can reveal how factors like fan base size or episode count relate to anime success.
+# This approach helps you reduce complexity but still focus on the key variables influencing success.
+
+## Summary:
+# PC1 (41.1% variance) contrasts anime popularity/community size metrics (popularity, favorites, members, score),
+# with popularity positively loaded, others negatively — suggesting a complex popularity structure.
+# PC2 (21.5%) contrasts duration (negative) with favorites and members (positive), reflecting length vs engagement.
+# PC3 (16.7%) is dominated by episodes count, strongly positive, capturing format/series length.
+# PC4 (12.6%) loads negatively on duration and popularity, adding nuance to medium-length anime traits.
+# PC5 (5.2%) isolates success (score and popularity) positively, separating quality-related factors.
+# The clusters (sizes 7417, 7656, 154) correspond to distinct groups along these dimensions.
+```
+
+## 11. MCA In-depth Plotting
+```{r, echo=FALSE}
+# Extract category coordinates matrix (loadings)
+category_coords <- mca_res$var$coord  # rows = categories, columns = dimensions
+
+# Number of dimensions you want to examine
+num_dims <- ncol(category_coords)
+
+# Number of top categories to extract per dimension
+top_n <- 10
+
+# Function to get top N contributors by absolute loading for a given dimension
+get_top_contributors <- function(coord_matrix, dim_index, top_n = 10) {
+  dim_coords <- coord_matrix[, dim_index]
+  top_indices <- order(abs(dim_coords), decreasing = TRUE)[1:top_n]
+  data.frame(
+    Category = rownames(coord_matrix)[top_indices],
+    Loading = dim_coords[top_indices]
+  )
+}
+
+# Loop over all dimensions and store results in a list
+top_contributors_all_dims <- lapply(1:num_dims, function(dim_i) {
+  df <- get_top_contributors(category_coords, dim_i, top_n)
+  df$Dimension <- paste0("Dim", dim_i)
+  df
+})
+
+# Combine all results into one data frame
+top_contributors_df <- bind_rows(top_contributors_all_dims)
+
+# Optional: print nicely for each dimension
+for (dim_i in 1:num_dims) {
+  cat("\n### Top", top_n, "Category Loadings for Dimension", dim_i, "\n")
+  dim_df <- filter(top_contributors_df, Dimension == paste0("Dim", dim_i))
+  print(kable(dim_df, digits = 3))
+}
+
+# Extract top 5 positive and negative loadings per dimension for interpretability
+for (dim_i in 1:num_dims) {
+  dim_coords <- mca_res$var$coord[, dim_i]
+  cat("\nDimension", dim_i, "Top positive loadings:\n")
+  print(sort(dim_coords, decreasing = TRUE)[1:5])
+  cat("\nDimension", dim_i, "Top negative loadings:\n")
+  print(sort(dim_coords, decreasing = FALSE)[1:5])
+}
+
+# Extract top 5 positive and negative loadings per dimension for interpretability
+for (dim_i in 1:num_dims) {
+  dim_coords <- mca_res$var$coord[, dim_i]
+  cat("\nDimension", dim_i, "Top positive loadings:\n")
+  print(sort(dim_coords, decreasing = TRUE)[1:5])
+  cat("\nDimension", dim_i, "Top negative loadings:\n")
+  print(sort(dim_coords, decreasing = FALSE)[1:5])
+}
+
+## Dimension	Interpretation Summary
+# Dim 1	Studio/producer prestige & niche genre contrast
+# Dim 2	Broadcast & mainstream genre influence
+# Dim 3	Media type & genre differentiation (TV vs Movie/OVA)
+# Dim 4	Slice-of-life, comedic, short-form & niche sources
+# Dim 5	Successful/popular dimension
+
+# Count number of categories per variable (i.e., per factor in MCA)
+cat_counts <- table(sub("_.*", "", rownames(mca_res$var$coord)))
+print(cat_counts)
+
+# Helper function: get top categories names per dimension
+get_top_categories <- function(coord_matrix, dim_index, top_n = 4) {
+  dim_coords <- coord_matrix[, dim_index]
+  top <- sort(abs(dim_coords), decreasing = TRUE)[1:top_n]
+  names(top)
+}
+
+dims_to_plot <- 1:4
+dim5 <- 5
+plots <- list()
+
+for (dim in dims_to_plot) {
+  # Get top 4 categories per dimension for labels
+  top_x_cats <- get_top_categories(mca_res$var$coord, dim)
+  top_y_cats <- get_top_categories(mca_res$var$coord, dim5)
+  top_cats <- unique(c(top_x_cats, top_y_cats))
+  
+  p <- fviz_mca_biplot(mca_res, 
+                       axes = c(dim, dim5),
+                       label = "none",
+                       col.ind = anime_clustered$cluster,
+                       palette = cluster_colors,
+                       geom.ind = "point",
+                       addEllipses = TRUE,
+                       ellipse.type = "convex",
+                       repel = TRUE) + 
+    theme_minimal() +
+    labs(title = paste0("MCA Biplot: Dim", dim, " vs Dim", dim5)) +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  vars_df <- as.data.frame(mca_res$var$coord)
+  vars_df$var_name <- rownames(vars_df)
+  vars_df <- vars_df %>% 
+    filter(var_name %in% top_cats) %>% 
+    mutate(
+      var_label = sub("^[^_]+_", "", var_name)  # Remove prefix before first underscore
+    )
+  
+  p <- p + 
+    geom_text_repel(
+      data = vars_df,
+      aes(
+        x = .data[[paste0("Dim ", dim)]], 
+        y = .data[[paste0("Dim ", dim5)]], 
+        label = var_label
+      ),
+      color = "black", size = 4, segment.color = "grey50"
+    )
+  
+  plots[[paste0("Dim", dim)]] <- p
+}
+
+# Arrange plots in a 2x2 grid
+grid.arrange(grobs = plots, ncol = 2, nrow = 2)
+
+
+
+# Arrange plots in a 2x2 grid
+grid.arrange(grobs = plots, ncol = 2, nrow = 2)
+
+var_names <- sub("_.*", "", rownames(mca_res$var$coord))
+top_cats_per_var <- data.frame(Category = rownames(mca_res$var$coord), 
+                               Variable = var_names,
+                               Coord_Dim1 = mca_res$var$coord[,1]) %>%
+  group_by(Variable) %>%
+  summarise(Top_Category = Category[which.max(abs(Coord_Dim1))])
+print(top_cats_per_var)
+
+## Summary of MCA Dimensions Interpretation:
+# Dim 1: Contrasts niche or less mainstream music-related sources and producers (e.g., "Music" source, "NHK" producer, "Music" type, "UNKNOWN" genres)
+#        versus adult or niche content producers and genres (e.g., "Milky Animation Label", "Pink Pineapple", "Hentai", "Visual novel").
+# Dim 2: Separates certain producers specialized in niche/erotic content (e.g., "Digital Works", "Pink Pineapple", "Hentai") and visual novel sources
+#        from more mainstream or action/adventure genre producers and studios (e.g., "TV Tokyo", "OLM").
+# Dim 3: Differentiates unknown or miscellaneous types and producers (e.g., "type_UNKNOWN", "Sanrio") and fantasy/avant-garde genres 
+#        from music-related sources and producers.
+# Dim 4: Highlights slice-of-life and comedy genres with web and 4-koma manga sources, opposed to more traditional studios like Madhouse and Toei Animation.
+# Dim 5: Captures a popularity/success dimension with categories like "Sanrio", "Comedy, Slice of Life", and "4-koma manga" positively associated,
+#        opposed to web novel sources, certain studios, and action genres negatively associated.
+# 
+# This MCA structure reflects how anime production variables (studios, producers, genres,
+```
+
+```{r, echo=FALSE}
+# Get the MCA coordinates and prepare category + variable extraction
+mca_coords <- as.data.frame(mca_res$var$coord)
+mca_coords$category <- rownames(mca_coords)
+mca_coords$variable <- sub("_.*", "", mca_coords$category)
+
+# Fix dimension column names to use consistent names like "Dim 1"
+dim_names <- colnames(mca_coords)[grepl("^Dim", colnames(mca_coords))]
+
+# Function to extract top contributors per dimension
+top_n_per_dim <- function(dim_col, n = 10) {
+  mca_coords %>%
+    dplyr::select(category, variable, coord = all_of(dim_col)) %>%
+    mutate(abs_coord = abs(coord)) %>%
+    arrange(desc(abs_coord)) %>%
+    slice(1:n) %>%
+    mutate(dimension = dim_col)
+}
+
+# Apply for the first 5 dimensions (or fewer if needed)
+top_contributors <- bind_rows(
+  lapply(dim_names[1:5], function(d) {
+    top_n_per_dim(d)
+  })
+)
+
+# Summarize Table 14: Count how many times each variable appears in top contributors
+table14 <- top_contributors %>%
+  count(variable, name = "top_contributions") %>%
+  arrange(desc(top_contributions))
+
+# View the table
+print(table14)
+
+```
+
+## 12. Modeling Anime Success Based on EDA-Informed Factors
+
+```{r, echo=FALSE}
+# STEP 1: Prepare modeling data with relevant EDA features
+set.seed(160)
+anime_model_data <- anime_long %>%
+  filter(!is.na(score)) %>%
+  left_join(anime_clustered[, c("anime_id", "cluster")], by = "anime_id") %>%
+  mutate(cluster = as.factor(cluster),
+         anime_id = as.character(anime_id))  # Convert anime_id to character early
+
+# Collapse rare levels of high-cardinality factors
+rare_collapse <- function(x, min_count = 30) {
+  forcats::fct_lump_min(x, min = min_count)
+}
+
+anime_model_data <- anime_model_data %>%
+  mutate(across(c(studios, producers, licensors, genres), rare_collapse))
+
+# STEP 2: Train/Test Split
+train_indices <- sample(seq_len(nrow(anime_model_data)), size = 0.7 * nrow(anime_model_data))
+train_data <- anime_model_data[train_indices, ] %>%
+  mutate(anime_id = as.character(anime_id))  # Ensure anime_id is character here too
+test_data <- anime_model_data[-train_indices, ] %>%
+  mutate(anime_id = as.character(anime_id))  # And here
+
+# STEP 3: Align factor levels between train/test
+factor_vars <- c("source", "type", "studios", "producers", "licensors", "genres", "cluster")
+train_data <- train_data %>%
+  mutate(across(all_of(factor_vars), ~ droplevels(as.factor(.))))
+for (var in factor_vars) {
+  train_levels <- levels(train_data[[var]])
+  train_data[[var]] <- factor(train_data[[var]], levels = train_levels)
+  test_data[[var]] <- factor(test_data[[var]], levels = train_levels)
+}
+
+# STEP 4: PCA-Based Features (PC1–PC5)
+pca_features <- pca_coords %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "anime_id") %>%
+  dplyr::select(anime_id, PC1, PC2, PC3, PC4, PC5)
+
+train_data <- left_join(train_data, pca_features, by = "anime_id")
+test_data <- left_join(test_data, pca_features, by = "anime_id")
+
+# STEP 5: Fit Model with EDA-Informed Predictors
+model_formula <- score ~ type + source + rating_age + episodes + duration_mins +
+  studios + producers + genres + cluster + PC1 + PC2 + PC3 + PC4 + PC5
+
+model <- lm(model_formula, data = train_data)
+
+# STEP 6: Cluster-Robust Standard Errors by anime_id
+cluster_se <- function(model, cluster) {
+  cluster <- as.factor(cluster)
+  M <- length(unique(cluster))
+  N <- length(cluster)
+  K <- model$rank
+  
+  dfc <- (M / (M - 1)) * ((N - 1) / (N - K))
+  est_fun <- sandwich::estfun(model)
+  uj <- apply(est_fun, 2, function(x) tapply(x, cluster, sum))
+  meat <- crossprod(uj) / N
+  vcovCL <- dfc * sandwich::sandwich(model, meat = meat)
+  return(vcovCL)
+}
+
+model_rows <- as.numeric(rownames(model.frame(model)))
+cluster <- train_data$anime_id[model_rows]
+cov_mat <- cluster_se(model, cluster)
+model_results <- lmtest::coeftest(model, vcov = cov_mat)
+summary(model_results)
+
+tidy_coefs <- broom::tidy(model_results)
+
+# Show only significant coefficients (e.g. p < 0.05)
+sig_coefs <- tidy_coefs %>% filter(p.value < 0.05)
+
+# Print just the significant coefficients (or top 10 if too many)
+print(head(sig_coefs, 10))
+
+cat("Number of observations:", nrow(train_data), "\n")
+cat("Number of unique anime_id clusters:", length(unique(train_data$anime_id)), "\n")
+
+## Summary:
+# The linear regression model predicting anime scores shows significant effects of both anime type and source.
+# Notably, TV type anime tend to have higher scores (+0.32), whereas Music, ONA, and OVA types tend to have lower scores by roughly 0.15 to 0.33 points.
+# Regarding source material, anime adapted from Card games, Games, Mixed media, and Originals tend to have significantly lower scores compared to the baseline.
+# The model is based on a large sample (53,158 observations) with 13,709 unique anime clusters, accounting for clustered error via robust standard errors.
+# These results align with exploratory analyses suggesting TV anime and certain source materials are associated with higher success metrics.
+```
