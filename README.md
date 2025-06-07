@@ -66,6 +66,11 @@ install.packages(c("tidyverse", "janitor", "skimr", "DataExplorer", "ggrepel",
                    "rlang", "ggfortify", "patchwork", "reshape2"))
 ```
 ---
+## Files
+- Dataset: anime-dataset-2023.csv
+- Report: Report on the Analysis of Anime Performance by Production Factors.pdf
+- Code: anime2023-data-project.Rmd
+---
 ## Key Findings
 - Production factors: Certain studios (e.g., Kyoto Animation), sources (e.g., manga), and types (e.g., TV series) are consistently linked to higher success.
 - Clustering: Five interpretable anime production clusters had strong links to genre, source, and studio.
